@@ -19,6 +19,7 @@ import io.netty.channel.Channel;
 import io.netty.channel.ChannelException;
 import io.netty.channel.EventLoop;
 import io.netty.channel.EventLoopException;
+import io.netty.channel.EventLoopTaskQueueFactory;
 import io.netty.channel.SelectStrategy;
 import io.netty.channel.SingleThreadEventLoop;
 import io.netty.util.IntSupplier;
@@ -33,8 +34,9 @@ import java.io.IOException;
 import java.lang.reflect.Field;
 import java.nio.channels.CancelledKeyException;
 import java.nio.channels.SelectableChannel;
-import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
+import java.nio.channels.SelectionKey;
+
 import java.nio.channels.spi.SelectorProvider;
 import java.security.AccessController;
 import java.security.PrivilegedAction;
@@ -58,7 +60,7 @@ public final class NioEventLoop extends SingleThreadEventLoop {
 
     private static final int CLEANUP_INTERVAL = 256; // XXX Hard-coded value, but won't need customization.
 
-    private static final boolean DISABLE_KEYSET_OPTIMIZATION =
+    private static final boolean DISABLE_KEY_SET_OPTIMIZATION =
             SystemPropertyUtil.getBoolean("io.netty.noKeySetOptimization", false);
 
     private static final int MIN_PREMATURE_SELECTOR_RETURNS = 3;
@@ -78,8 +80,8 @@ public final class NioEventLoop extends SingleThreadEventLoop {
     // - https://github.com/netty/netty/issues/203
     static {
         final String key = "sun.nio.ch.bugLevel";
-        final String buglevel = SystemPropertyUtil.get(key);
-        if (buglevel == null) {
+        final String bugLevel = SystemPropertyUtil.get(key);
+        if (bugLevel == null) {
             try {
                 AccessController.doPrivileged(new PrivilegedAction<Void>() {
                     @Override
@@ -101,7 +103,7 @@ public final class NioEventLoop extends SingleThreadEventLoop {
         SELECTOR_AUTO_REBUILD_THRESHOLD = selectorAutoRebuildThreshold;
 
         if (logger.isDebugEnabled()) {
-            logger.debug("-Dio.netty.noKeySetOptimization: {}", DISABLE_KEYSET_OPTIMIZATION);
+            logger.debug("-Dio.netty.noKeySetOptimization: {}", DISABLE_KEY_SET_OPTIMIZATION);
             logger.debug("-Dio.netty.selectorAutoRebuildThreshold: {}", SELECTOR_AUTO_REBUILD_THRESHOLD);
         }
     }
@@ -130,8 +132,10 @@ public final class NioEventLoop extends SingleThreadEventLoop {
     private boolean needsToSelectAgain;
 
     NioEventLoop(NioEventLoopGroup parent, Executor executor, SelectorProvider selectorProvider,
-                 SelectStrategy strategy, RejectedExecutionHandler rejectedExecutionHandler) {
-        super(parent, executor, false, DEFAULT_MAX_PENDING_TASKS, rejectedExecutionHandler);
+                 SelectStrategy strategy, RejectedExecutionHandler rejectedExecutionHandler,
+                 EventLoopTaskQueueFactory queueFactory) {
+        super(parent, executor, false, newTaskQueue(queueFactory), newTaskQueue(queueFactory),
+                rejectedExecutionHandler);
         if (selectorProvider == null) {
             throw new NullPointerException("selectorProvider");
         }
@@ -143,6 +147,14 @@ public final class NioEventLoop extends SingleThreadEventLoop {
         selector = selectorTuple.selector;
         unwrappedSelector = selectorTuple.unwrappedSelector;
         selectStrategy = strategy;
+    }
+
+    private static Queue<Runnable> newTaskQueue(
+            EventLoopTaskQueueFactory queueFactory) {
+        if (queueFactory == null) {
+            return newTaskQueue0(DEFAULT_MAX_PENDING_TASKS);
+        }
+        return queueFactory.newTaskQueue(DEFAULT_MAX_PENDING_TASKS);
     }
 
     private static final class SelectorTuple {
@@ -168,7 +180,7 @@ public final class NioEventLoop extends SingleThreadEventLoop {
             throw new ChannelException("failed to open a new selector", e);
         }
 
-        if (DISABLE_KEYSET_OPTIMIZATION) {
+        if (DISABLE_KEY_SET_OPTIMIZATION) {
             return new SelectorTuple(unwrappedSelector);
         }
 
@@ -264,9 +276,13 @@ public final class NioEventLoop extends SingleThreadEventLoop {
 
     @Override
     protected Queue<Runnable> newTaskQueue(int maxPendingTasks) {
+        return newTaskQueue0(maxPendingTasks);
+    }
+
+    private static Queue<Runnable> newTaskQueue0(int maxPendingTasks) {
         // This event loop never calls takeTask()
         return maxPendingTasks == Integer.MAX_VALUE ? PlatformDependent.<Runnable>newMpscQueue()
-                                                    : PlatformDependent.<Runnable>newMpscQueue(maxPendingTasks);
+                : PlatformDependent.<Runnable>newMpscQueue(maxPendingTasks);
     }
 
     /**
@@ -293,6 +309,26 @@ public final class NioEventLoop extends SingleThreadEventLoop {
             throw new IllegalStateException("event loop shut down");
         }
 
+        if (inEventLoop()) {
+            register0(ch, interestOps, task);
+        } else {
+            try {
+                // Offload to the EventLoop as otherwise java.nio.channels.spi.AbstractSelectableChannel.register
+                // may block for a long time while trying to obtain an internal lock that may be hold while selecting.
+                submit(new Runnable() {
+                    @Override
+                    public void run() {
+                        register0(ch, interestOps, task);
+                    }
+                }).sync();
+            } catch (InterruptedException ignore) {
+                // Even if interrupted we did schedule it so just mark the Thread as interrupted.
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    private void register0(SelectableChannel ch, int interestOps, NioTask<?> task) {
         try {
             ch.register(unwrappedSelector, interestOps, task);
         } catch (Exception e) {
@@ -333,6 +369,11 @@ public final class NioEventLoop extends SingleThreadEventLoop {
             return;
         }
         rebuildSelector0();
+    }
+
+    @Override
+    public int registeredChannels() {
+        return selector.keys().size() - cancelledKeys;
     }
 
     private void rebuildSelector0() {
@@ -401,7 +442,8 @@ public final class NioEventLoop extends SingleThreadEventLoop {
     protected void run() {
         for (;;) {
             try {
-                switch (selectStrategy.calculateStrategy(selectNowSupplier, hasTasks())) {
+                try {
+                    switch (selectStrategy.calculateStrategy(selectNowSupplier, hasTasks())) {
                     case SelectStrategy.CONTINUE:
                         continue;
 
@@ -444,6 +486,13 @@ public final class NioEventLoop extends SingleThreadEventLoop {
                         }
                         // fall through
                     default:
+                    }
+                } catch (IOException e) {
+                    // If we receive an IOException here its because the Selector is messed up. Let's rebuild
+                    // the selector and retry. https://github.com/netty/netty/issues/8566
+                    rebuildSelector0();
+                    handleLoopException(e);
+                    continue;
                 }
 
                 cancelledKeys = 0;
@@ -785,17 +834,9 @@ public final class NioEventLoop extends SingleThreadEventLoop {
                     selectCnt = 1;
                 } else if (SELECTOR_AUTO_REBUILD_THRESHOLD > 0 &&
                         selectCnt >= SELECTOR_AUTO_REBUILD_THRESHOLD) {
-                    // The selector returned prematurely many times in a row.
-                    // Rebuild the selector to work around the problem.
-                    logger.warn(
-                            "Selector.select() returned prematurely {} times in a row; rebuilding Selector {}.",
-                            selectCnt, selector);
-
-                    rebuildSelector();
-                    selector = this.selector;
-
-                    // Select again to populate selectedKeys.
-                    selector.selectNow();
+                    // The code exists in an extra method to ensure the method is not too big to inline as this
+                    // branch is not very likely to get hit very frequently.
+                    selector = selectRebuildSelector(selectCnt);
                     selectCnt = 1;
                     break;
                 }
@@ -816,6 +857,21 @@ public final class NioEventLoop extends SingleThreadEventLoop {
             }
             // Harmless exception - log anyway
         }
+    }
+
+    private Selector selectRebuildSelector(int selectCnt) throws IOException {
+        // The selector returned prematurely many times in a row.
+        // Rebuild the selector to work around the problem.
+        logger.warn(
+                "Selector.select() returned prematurely {} times in a row; rebuilding Selector {}.",
+                selectCnt, selector);
+
+        rebuildSelector();
+        Selector selector = this.selector;
+
+        // Select again to populate selectedKeys.
+        selector.selectNow();
+        return selector;
     }
 
     private void selectAgain() {
